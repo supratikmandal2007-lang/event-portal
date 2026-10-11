@@ -1,0 +1,100 @@
+rules_version = '2';
+
+// Campus Event Pass — Firestore security rules.
+// Paste this whole file into Firebase console → Firestore Database → Rules → Publish.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+    function myEmail() {
+      return request.auth.token.email.lower();
+    }
+    function isAdmin() {
+      return signedIn() && exists(/databases/$(database)/documents/admins/$(myEmail()));
+    }
+    function memberPath() {
+      return /databases/$(database)/documents/members/$(request.auth.uid);
+    }
+
+    // Personal email providers. Only "1st year" members may sign up with one.
+    function personalDomains() {
+      return ['gmail.com','googlemail.com','yahoo.com','yahoo.co.in','outlook.com','hotmail.com',
+              'live.com','msn.com','icloud.com','me.com','rediffmail.com','proton.me',
+              'protonmail.com','aol.com','zoho.com','yandex.com','gmx.com'];
+    }
+    function allowedDomains() {
+      let p = /databases/$(database)/documents/settings/portal;
+      return exists(p) ? get(p).data.get('allowedDomains', []) : [];
+    }
+    function emailOkForYear(year) {
+      let domain = myEmail().split('@')[1];
+      let allowed = allowedDomains();
+      return year == '1st year'
+        || (allowed.size() > 0 && domain in allowed)
+        || (allowed.size() == 0 && !(domain in personalDomains()));
+    }
+
+    // Portal name, organiser, allowed domains: readable before sign-in.
+    match /settings/{doc} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Admins are added by hand in the Firebase console: collection "admins",
+    // document ID = the admin's email in lowercase.
+    // Single lookups are open so the sign-up form can let admins use any email.
+    match /admins/{email} {
+      allow get: if true;
+      allow list: if false;
+      allow write: if false;
+    }
+
+    match /events/{eid} {
+      allow read: if signedIn() && (resource.data.status == 'published' || isAdmin());
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || seatChange(eid);
+    }
+
+    // A member may only move an event's seat count by one, in the same batch
+    // that adds or removes their own registration.
+    function seatChange(eid) {
+      let before = resource.data.get('regCount', 0);
+      let after = request.resource.data.get('regCount', 0);
+      let mineBefore = get(memberPath()).data.get('rsvps', {});
+      let mineAfter = getAfter(memberPath()).data.get('rsvps', {});
+      let cap = resource.data.get('capacity', null);
+      return signedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['regCount'])
+        && (
+          (after == before + 1 && !(eid in mineBefore) && (eid in mineAfter)
+             && (cap == null || cap == 0 || after <= cap))
+          || (after == before - 1 && after >= 0 && (eid in mineBefore) && !(eid in mineAfter))
+        );
+    }
+
+    // Online joining links: only admins and people registered for that event.
+    match /eventLinks/{eid} {
+      allow read: if isAdmin() || (signedIn() && eid in get(memberPath()).data.get('rsvps', {}));
+      allow write: if isAdmin();
+    }
+
+    match /members/{uid} {
+      allow read: if signedIn() && (uid == request.auth.uid || isAdmin());
+      allow create, update: if signedIn() && uid == request.auth.uid
+        && request.resource.data.email == myEmail()
+        && request.resource.data.year is string
+        && (emailOkForYear(request.resource.data.year) || isAdmin())
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2;
+      allow delete: if signedIn() && (uid == request.auth.uid || isAdmin());
+    }
+
+    match /notices/{nid} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+  }
+}
